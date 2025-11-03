@@ -1,5 +1,5 @@
 # Advanced Separation Processes - Part 2: Breakthrough Simulation
-# Author: <your name>
+# Author: 
 # Course: CHEN40461/60461 - Advanced Separation Processes AY 2025-26
 # Run in Jupyter:
 #     %run asp_breakthrough_model.py
