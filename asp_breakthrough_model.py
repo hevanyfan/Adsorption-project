@@ -31,15 +31,15 @@ class BreakthroughConfig:
     P_tot: float = 100e3     # Pa
     R: float = 8.314         # m^3 Pa / (mol K)
     u_in: float = 4.864e-3   # m/s (superficial velocity)
-    D_m: float = 7.48e-5     # m^2/s  (molecular diffusivity)
+    D_m: float = 7.48e-5     # m^2/s  (molecular diffusivity) e-5
 
     # LDF kinetics (tunable for sensitivity)
-    k_N2: float = 0.1        # s^-1
-    k_O2: float = 0.1        # s^-1
+    k_N2: float = 0.1        # s^-1 0.1
+    k_O2: float = 0.1        # s^-1 0.1
 
     # Discretization & solver
     Nz: int = 80
-    t_end: float = 1200.0    # s
+    t_end: float = 20.0    # s
     atol: float = 1e-6
     rtol: float = 1e-4
     use_interstitial_velocity: bool = False  # True → use u_in/omega
@@ -166,34 +166,47 @@ def rhs(t, y, *, pars, cfg):
 
 def simulate(pars, cfg, material):
     Nz = cfg.Nz
-    # initial: bed & solid saturated with O2
-    yN2_0 = np.zeros(Nz); yO2_0 = np.ones(Nz)
-    qN2_0 = np.zeros(Nz); qO2_0 = sips_q(pars, material, "O2", cfg.P_tot*np.ones(Nz))
+    yN2_0 = np.zeros(Nz)
+    yO2_0 = np.ones(Nz)
+    qN2_0 = np.zeros(Nz)
+    qO2_0 = sips_q(pars, material, "O2", cfg.P_tot * np.ones(Nz))
     y0 = np.concatenate([yN2_0, yO2_0, qN2_0, qO2_0])
 
-    # events on outlet yN2
+    # --- Event function uses normalized outlet y_N2 ---
     def ev(thr):
-        def f(t,y): return y[Nz-1] - thr
-        f.terminal = False; f.direction = 1
+        def f(t, Y):
+            yN2 = Y[0:Nz]
+            yO2 = Y[Nz:2*Nz]
+            s = yN2 + yO2 + 1e-16
+            yN2_out_norm = yN2[-1] / s[-1]
+            return yN2_out_norm - thr
+        f.terminal = False
+        f.direction = 1
         return f
 
     cfg_local = BreakthroughConfig(**asdict(CFG))
-    cfg_local.material = material  # runtime attach
+    cfg_local.material = material
 
-    sol = solve_ivp(lambda t,Y: rhs(t,Y, pars=pars, cfg=cfg_local),
+    sol = solve_ivp(lambda t, Y: rhs(t, Y, pars=pars, cfg=cfg_local),
                     (0.0, cfg.t_end), y0, method="BDF",
                     atol=cfg.atol, rtol=cfg.rtol,
                     events=[ev(0.05), ev(0.50), ev(0.95)])
 
-    t = sol.t
-    yN2_out = sol.y[0:Nz, :][-1, :]
-    yO2_out = sol.y[Nz:2*Nz, :][-1, :]
-    t5  = sol.t_events[0][0] if len(sol.t_events[0])>0 else np.nan
-    t50 = sol.t_events[1][0] if len(sol.t_events[1])>0 else np.nan
-    t95 = sol.t_events[2][0] if len(sol.t_events[2])>0 else np.nan
+    # --- Normalize outlet mole fractions before exporting ---
+    yN2_raw = sol.y[0:Nz, :]
+    yO2_raw = sol.y[Nz:2*Nz, :]
+    s_out = yN2_raw[-1, :] + yO2_raw[-1, :] + 1e-16
+    yN2_out = np.clip(yN2_raw[-1, :] / s_out, 0.0, 1.0)
+    yO2_out = 1.0 - yN2_out  # binary system -> enforce consistency
 
-    return dict(t=t, yN2_out=yN2_out, yO2_out=yO2_out,
-                t5=t5, t50=t50, t95=t95, success=sol.success, message=sol.message)
+    # Breakthrough times (already based on normalized y)
+    t5  = sol.t_events[0][0] if len(sol.t_events[0]) > 0 else np.nan
+    t50 = sol.t_events[1][0] if len(sol.t_events[1]) > 0 else np.nan
+    t95 = sol.t_events[2][0] if len(sol.t_events[2]) > 0 else np.nan
+
+    return dict(t=sol.t, yN2_out=yN2_out, yO2_out=yO2_out,
+                t5=t5, t50=t50, t95=t95, success=sol.success)
+
 
 def run_baseline_and_export():
     # 1) fit
