@@ -1,0 +1,302 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from dataclasses import dataclass
+from scipy.optimize import curve_fit
+from scipy.integrate import solve_ivp
+
+# ---------------------------------------
+# 0. Config
+# ---------------------------------------
+@dataclass
+class BreakthroughConfig:
+    L: float = 0.32
+    eps: float = 0.32
+    rho_s: float = 990.0
+    r_p: float = 1e-3
+    T: float = 303.0
+    P_tot: float = 100e3
+    R: float = 8.314
+    u_in: float = 4.864e-3
+    D_m: float = 7.481e-5   # from Table 2
+    tau: float = 3.0        # tortuosity from Table 2
+
+    k_N2: float = None      # will be set later
+    k_O2: float = None
+    N: int = 80
+    t_end: float = 0.02
+    atol: float = 1e-6
+    rtol: float = 1e-4
+
+CFG = BreakthroughConfig()
+
+def k_glueckauf_from_Dm(cfg: BreakthroughConfig):
+    # Dp ≈ Dm / tau
+    Dp = cfg.D_m / cfg.tau
+    return 15.0 * Dp / (cfg.r_p**2)
+
+# ---------------------------------------
+# 1. Table 1 data (Romulus/Remus × N2/O2)
+# ---------------------------------------
+P_N2_Romulus = np.array([
+    0.0, 2026.5, 3039.75, 4053.0, 6079.5, 8106.0,
+    61909.575, 111356.175, 173265.75, 247435.65,
+    321706.875, 395978.1, 470148.0, 544419.225, 618690.45
+])
+q_N2_Romulus = np.array([
+    0.000, 0.025, 0.038, 0.053, 0.079, 0.108,
+    0.562, 0.835, 1.082, 1.295, 1.482,
+    1.597, 1.714, 1.795, 1.861
+])
+
+P_O2_Romulus = np.array([
+    0.0, 8106.0, 20265.0, 247435.65,
+    371153.475, 494871.3, 618690.45
+])
+q_O2_Romulus = np.array([
+    0.000, 0.015, 0.035, 0.366,
+    0.521, 0.693, 0.815
+])
+
+P_N2_Remus = np.array([
+    0.0, 63400.0, 88700.0, 117500.0,
+    162500.0, 208500.0, 303800.0, 427000.0,
+    609500.0, 776600.0, 919000.0
+])
+q_N2_Remus = np.array([
+    0.000, 0.1674, 0.2300, 0.2994,
+    0.3934, 0.4848, 0.6450, 0.8280,
+    1.0588, 1.2249, 1.3472
+])
+
+P_O2_Remus = np.array([
+    0.0, 33200.0, 61300.0, 96100.0,
+    143200.0, 214800.0, 355900.0, 548200.0,
+    747900.0, 859000.0, 931700.0
+])
+q_O2_Remus = np.array([
+    0.000, 0.0372, 0.0679, 0.1022,
+    0.1504, 0.2138, 0.3455, 0.5089,
+    0.6830, 0.7679, 0.8348
+])
+
+# ---------------------------------------
+# 2. Sips isotherm + fitting
+# ---------------------------------------
+def sips_isotherm(P, qmax, b, n):
+    """Sips isotherm: q = qmax * (bP)^n / (1 + (bP)^n)"""
+    x = (b * P)**n
+    return qmax * x / (1.0 + x)
+
+def fit_sips(P, q):
+    p0 = [2.0, 1e-5, 0.9]
+    bounds = ([0.0, 0.0, 0.0], [np.inf, np.inf, np.inf])
+    (qmax, b, n), _ = curve_fit(
+        sips_isotherm, P, q, p0=p0,
+        bounds=bounds, maxfev=200000
+    )
+    return float(qmax), float(b), float(n)
+
+def get_all_sips_params():
+    """
+    Returns dictionary:
+      pars[(material, gas)] = (qmax, b, n)
+      material ∈ {"Romulus","Remus"}, gas ∈ {"N2","O2"}
+    """
+    pars = {}
+    pars[("Romulus","N2")] = fit_sips(P_N2_Romulus, q_N2_Romulus)
+    pars[("Romulus","O2")] = fit_sips(P_O2_Romulus, q_O2_Romulus)
+    pars[("Remus","N2")]   = fit_sips(P_N2_Remus,   q_N2_Remus)
+    pars[("Remus","O2")]   = fit_sips(P_O2_Remus,   q_O2_Remus)
+    return pars
+
+# ---------------------------------------
+# 3. Two-gas PDE + LDF (GitHub-style MOL)
+# ---------------------------------------
+def rhs_two_gas(t, Y, cfg: BreakthroughConfig, sips_params_mat):
+    """
+    Two-gas (N2 + O2) breakthrough model.
+    State vector Y of length 4N:
+
+      Y = [yN2(0..N-1), yO2(0..N-1), qN2(0..N-1), qO2(0..N-1)]
+
+    GitHub-style:
+      - method-of-lines
+      - ghost cells for BCs
+      - vectorised finite differences
+    """
+    N = cfg.N
+    dz = cfg.L / (N - 1)
+    # choose interstitial velocity v = u_in / eps
+    v = cfg.u_in # can't determing eps in real life, superficial is used there
+    # axial dispersion (brief): DL = 0.7 D_m + u_in r_p
+    D_L =0 # 0.7 * cfg.D_m + cfg.u_in * cfg.r_p
+
+    # unpack
+    yN2 = Y[0:N]
+    yO2 = Y[N:2*N]
+    qN2 = Y[2*N:3*N]
+    qO2 = Y[3*N:4*N]
+
+    # renormalise gas mole fractions (avoid drift)
+    s = yN2 + yO2 + 1e-16
+    yN2 = np.clip(yN2 / s, 0.0, 1.0)
+    yO2 = np.clip(yO2 / s, 0.0, 1.0)
+
+    # Sips equilibrium loadings
+    qmax_N2, b_N2, n_N2 = sips_params_mat["N2"]
+    qmax_O2, b_O2, n_O2 = sips_params_mat["O2"]
+
+    P_N2 = cfg.P_tot * yN2
+    P_O2 = cfg.P_tot * yO2
+
+    qN2_star = sips_isotherm(P_N2, qmax_N2, b_N2, n_N2)
+    qO2_star = sips_isotherm(P_O2, qmax_O2, b_O2, n_O2)
+
+    # LDF kinetics
+    dqN2_dt = cfg.k_N2 * (qN2_star - qN2)
+    dqO2_dt = cfg.k_O2 * (qO2_star - qO2)
+
+    # boundary conditions via ghost cells
+    # inlet: feed = pure N2 (yN2=1, yO2=0)
+    yN2_feed, yO2_feed = 1.0, 0.0
+    yN2_left = yN2_feed
+    yO2_left = yO2_feed
+
+    # outlet: zero-gradient (Neumann): y_N = y_{N-1}
+    yN2_right = yN2[-1]
+    yO2_right = yO2[-1]
+
+    # build extended arrays: [ghost_left, interior..., ghost_right]
+    yN2_ext = np.concatenate(([yN2_left], yN2, [yN2_right]))
+    yO2_ext = np.concatenate(([yO2_left], yO2, [yO2_right]))
+
+    # 1st derivative (upwind/backward difference) & 2nd derivative (central)
+    dyN2_dz   = (yN2_ext[1:-1] - yN2_ext[:-2]) / dz
+    d2yN2_dz2 = (yN2_ext[2:]   - 2.0*yN2_ext[1:-1] + yN2_ext[:-2]) / dz**2
+
+    dyO2_dz   = (yO2_ext[1:-1] - yO2_ext[:-2]) / dz
+    d2yO2_dz2 = (yO2_ext[2:]   - 2.0*yO2_ext[1:-1] + yO2_ext[:-2]) / dz**2
+
+    # gas-phase PDEs
+    factor = (cfg.R * cfg.T / cfg.P_tot) * (cfg.rho_s * (1.0 - cfg.eps) / cfg.eps)
+
+    dyN2_dt = D_L * d2yN2_dz2 - v * dyN2_dz + factor * dqN2_dt
+    dyO2_dt = D_L * d2yO2_dz2 - v * dyO2_dz + factor * dqO2_dt
+
+    # pack back into single vector
+    return np.concatenate([dyN2_dt, dyO2_dt, dqN2_dt, dqO2_dt])
+
+# ---------------------------------------
+# 4. Simulation wrapper for one material
+# ---------------------------------------
+def simulate_material(material: str, cfg: BreakthroughConfig, all_sips_params):
+    """
+    Simulate breakthrough for one material (Romulus / Remus).
+    Returns dict with time, outlet yN2/yO2, and t5,t50,t95 for N2.
+    """
+    N = cfg.N
+
+    # extract Sips parameters for this material
+    sips_params_mat = {
+        "N2": all_sips_params[(material, "N2")],
+        "O2": all_sips_params[(material, "O2")],
+    }
+
+    # initial condition:
+    #   gas: bed initially pure O2 -> yN2=0, yO2=1
+    #   solid: N2 loading 0; O2 loading at equilibrium with P_O2 = P_tot
+    yN2_0 = np.zeros(N)
+    yO2_0 = np.ones(N)
+
+    qN2_0 = np.zeros(N)
+
+    qmax_O2, b_O2, n_O2 = sips_params_mat["O2"]
+    P_O2_init = cfg.P_tot * np.ones(N)
+    qO2_0 = sips_isotherm(P_O2_init, qmax_O2, b_O2, n_O2)
+
+    Y0 = np.concatenate([yN2_0, yO2_0, qN2_0, qO2_0])
+
+    t_span = (0.0, cfg.t_end)
+    t_eval = np.linspace(t_span[0], t_span[1], 400)
+
+    sol = solve_ivp(
+        lambda t, Y: rhs_two_gas(t, Y, cfg, sips_params_mat),
+        t_span,
+        Y0,
+        method="BDF",
+        t_eval=t_eval,
+        atol=cfg.atol,
+        rtol=cfg.rtol,
+    )
+
+    if not sol.success:
+        print(f"[WARN] solve_ivp did not converge for {material}")
+
+    t = sol.t
+
+# raw fields from solver
+    yN2_raw = sol.y[0:N, :]
+    yO2_raw = sol.y[N:2*N, :]
+
+# renormalize to enforce yN2 + yO2 = 1 and 0 <= y <= 1
+    s_all = yN2_raw + yO2_raw + 1e-16
+    yN2_all = np.clip(yN2_raw / s_all, 0.0, 1.0)
+    yO2_all = 1.0 - yN2_all  # binary system → enforce complement
+
+# outlet (last grid point)
+    yN2_out = yN2_all[-1, :]
+    yO2_out = yO2_all[-1, :]
+
+
+    # helper: breakthrough time at given outlet y_N2
+    def breakthrough_time(target):
+        if yN2_out.max() < target:
+            return np.nan
+        return np.interp(target, yN2_out, t)
+
+    t5  = breakthrough_time(0.05)
+    t50 = breakthrough_time(0.50)
+    t95 = breakthrough_time(0.95)
+
+    return {
+        "t": t,
+        "yN2_out": yN2_out,
+        "yO2_out": yO2_out,
+        "t5": t5,
+        "t50": t50,
+        "t95": t95,
+        "success": sol.success,
+    }
+
+# ---------------------------------------
+# 5. Main: run Romulus & Remus and plot
+# ---------------------------------------
+if __name__ == "__main__":
+    all_sips = get_all_sips_params()
+
+    k_val = k_glueckauf_from_Dm(CFG)
+    CFG.k_N2 = k_val
+    CFG.k_O2 = k_val    # or different if you want
+
+    print(f"Using Glueckauf k = {k_val:.3e} s^-1")
+    
+    results = {}
+    for mat in ("Romulus", "Remus"):
+        print(f"\n[RUN] {mat}")
+        res = simulate_material(mat, CFG, all_sips)
+        results[mat] = res
+        print(f"{mat}: t_5%  = {res['t5']:.3f} s")
+        print(f"{mat}: t_50% = {res['t50']:.3f} s")
+        print(f"{mat}: t_95% = {res['t95']:.3f} s")
+
+    # Plot outlet N2 for both materials
+    plt.figure(figsize=(6, 4))
+    for mat, style in zip(("Romulus", "Remus"), ("-", "--")):
+        res = results[mat]
+        plt.plot(res["t"], res["yN2_out"], style, label=mat)
+    plt.xlabel("Time (s)")
+    plt.ylabel("Outlet $y_{N2}$ (-)")
+    plt.title("N$_2$ breakthrough at outlet\n(feed: N$_2$=1, bed initially O$_2$-saturated)")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
